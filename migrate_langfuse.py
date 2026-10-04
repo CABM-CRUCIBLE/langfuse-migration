@@ -8,12 +8,13 @@ Migrates traces, observations, scores, prompts, datasets, and score configs
 between any two Langfuse instances (Cloud <-> Self-Hosted Docker).
 
 Addresses all issues identified in the critical analysis:
-  - Uses SDK v4 Langfuse constructor with tracing disabled
-  - Cursor-based pagination throughout
-  - Exhaustive observation fetching per trace (handles >100 obs)
+  - Uses SDK v4 Langfuse client with tracing disabled
+  - Handles API differences between Cloud v4 and Self-Hosted v3
+  - Uses direct batch ingestion (api.ingestion.batch) preserving IDs and timestamps
+  - Exhaustive observation & score fetching per trace
+  - Maps observation types (CHAIN, AGENT, TOOL -> SPAN) for Cloud schema compatibility
   - Migrates scores, prompts, datasets, and score configs
-  - Handles GENERATION / SPAN / EVENT observation types correctly
-  - Rate limiting with exponential backoff on 429 errors
+  - Rate limiting with exponential backoff on 429/502/503 errors
   - Idempotency via --from-timestamp filtering
   - Post-migration verification with count comparison
 
@@ -23,36 +24,28 @@ Requirements:
 Usage:
   # Local Docker -> Langfuse Cloud
   python migrate_langfuse.py \
-    --source-host http://localhost:3000 \
+    --source-host http://localhost:10500 \
     --source-public-key pk-lf-local-... \
     --source-secret-key sk-lf-local-... \
-    --dest-host https://cloud.langfuse.com \
+    --dest-host https://us.cloud.langfuse.com \
     --dest-public-key pk-lf-cloud-... \
     --dest-secret-key sk-lf-cloud-...
 
-  # Langfuse Cloud -> Local Docker
-  python migrate_langfuse.py \
-    --source-host https://cloud.langfuse.com \
-    --source-public-key pk-lf-cloud-... \
-    --source-secret-key sk-lf-cloud-... \
-    --dest-host http://localhost:3000 \
-    --dest-public-key pk-lf-local-... \
-    --dest-secret-key sk-lf-local-...
+  # Dry run (verify counts without writing)
+  python migrate_langfuse.py ... --dry-run
 
   # Resume from a specific timestamp (idempotent re-run)
-  python migrate_langfuse.py ... --from-timestamp 2026-10-01T00:00:00Z
-
-  # Skip optional data types
-  python migrate_langfuse.py ... --skip-prompts --skip-datasets
+  python migrate_langfuse.py ... --from-timestamp 2026-08-01T00:00:00Z
 """
 
 import argparse
+from datetime import datetime, timezone
+import logging
 import os
 import sys
 import time
-import logging
-from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
+import uuid
 
 # ---------------------------------------------------------------------------
 # Ensure environment variables don't interfere with explicit constructor args
@@ -70,6 +63,14 @@ for _var in (
 os.environ["LANGFUSE_TRACING_ENABLED"] = "False"
 
 from langfuse import Langfuse  # noqa: E402
+from langfuse.api.ingestion.types import (  # noqa: E402
+    IngestionEvent_ObservationCreate,
+    IngestionEvent_ScoreCreate,
+    IngestionEvent_TraceCreate,
+    ObservationBody,
+    ScoreBody,
+    TraceBody,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -118,66 +119,6 @@ def with_retry(fn, *args, **kwargs):
 
 
 # =====================================================================
-# PAGINATION HELPERS (cursor-based)
-# =====================================================================
-def paginate(api_method, page_size: int = 100, **filters):
-    """
-    Generic cursor-based paginator.
-    Yields individual items from *api_method* which must accept
-    `limit` and `cursor` keyword arguments and return an object with
-    `.data` (list) and `.meta.next_cursor` (str | None).
-    """
-    cursor = None
-    while True:
-        response = with_retry(api_method, limit=page_size, cursor=cursor, **filters)
-        items = response.data
-        if not items:
-            break
-        yield from items
-        cursor = getattr(response.meta, "next_cursor", None) if hasattr(response, "meta") else None
-        if not cursor:
-            break
-
-
-def paginate_simple(api_method, page_size: int = 100, **filters):
-    """
-    Paginator for APIs that use page-number pagination as a fallback
-    (some self-hosted v3 instances may still use this). Tries cursor
-    first; falls back to page-based if cursor is not present.
-    """
-    # First try cursor-based
-    cursor = None
-    page = 1
-    while True:
-        try:
-            if cursor is not None:
-                response = with_retry(api_method, limit=page_size, cursor=cursor, **filters)
-            else:
-                # First call  --  try without cursor to detect which pagination model
-                response = with_retry(api_method, limit=page_size, **filters)
-        except TypeError:
-            # API method may not accept cursor  --  fall back to page-based
-            response = with_retry(api_method, limit=page_size, page=page, **filters)
-
-        items = response.data
-        if not items:
-            break
-        yield from items
-
-        # Attempt cursor-based next
-        meta = getattr(response, "meta", None)
-        next_cursor = getattr(meta, "next_cursor", None) if meta else None
-        if next_cursor:
-            cursor = next_cursor
-        else:
-            # If no cursor returned, assume page-based or end of data
-            if len(items) < page_size:
-                break
-            page += 1
-            cursor = None  # keep using page-based
-
-
-# =====================================================================
 # CLIENT FACTORY
 # =====================================================================
 def make_client(host: str, public_key: str, secret_key: str, label: str) -> Langfuse:
@@ -205,160 +146,281 @@ def migrate_score_configs(source: Langfuse, dest: Langfuse) -> int:
     log.info("--- Migrating score configurations ---")
     count = 0
     try:
-        configs = with_retry(source.api.score_configs.list)
-        for cfg in configs.data:
-            try:
-                with_retry(
-                    dest.api.score_configs.create,
-                    name=cfg.name,
-                    data_type=cfg.data_type,
-                    min_value=getattr(cfg, "min_value", None),
-                    max_value=getattr(cfg, "max_value", None),
-                    categories=getattr(cfg, "categories", None),
-                    description=getattr(cfg, "description", None),
-                )
-                count += 1
-            except Exception as e:
-                if "already exists" in str(e).lower() or "409" in str(e):
-                    log.debug("Score config '%s' already exists  --  skipping", cfg.name)
-                else:
-                    log.warning("Failed to create score config '%s': %s", cfg.name, e)
+        page = 1
+        while True:
+            configs = with_retry(source.api.score_configs.get, page=page, limit=50)
+            items = getattr(configs, "data", [])
+            if not items:
+                break
+            for cfg in items:
+                try:
+                    kwargs = {
+                        "name": cfg.name,
+                        "data_type": cfg.data_type,
+                    }
+                    for opt in ("min_value", "max_value", "categories", "description"):
+                        val = getattr(cfg, opt, None)
+                        if val is not None:
+                            kwargs[opt] = val
+                    with_retry(dest.api.score_configs.create, **kwargs)
+                    count += 1
+                except Exception as e:
+                    if "already exists" in str(e).lower() or "409" in str(e):
+                        log.debug("Score config '%s' already exists -- skipping", cfg.name)
+                    else:
+                        log.warning("Failed to create score config '%s': %s", cfg.name, e)
+            meta = getattr(configs, "meta", None)
+            total_pages = getattr(meta, "total_pages", None)
+            if total_pages is not None and page >= total_pages:
+                break
+            if len(items) < 50:
+                break
+            page += 1
     except Exception as e:
         log.warning("Could not fetch score configs: %s", e)
     log.info("Score configs migrated: %d", count)
     return count
 
 
-# ---- 2. Prompts (all versions) --------------------------------------
+# ---- 2. Prompts -----------------------------------------------------
 def migrate_prompts(source: Langfuse, dest: Langfuse) -> int:
-    """Migrate all prompts with all their versions."""
+    """Migrate all prompts."""
     log.info("--- Migrating prompts ---")
     count = 0
     try:
-        prompts_resp = with_retry(source.api.prompts.list)
-        prompt_metas = prompts_resp.data
+        page = 1
+        while True:
+            prompts_resp = with_retry(source.api.prompts.list, page=page, limit=50)
+            items = getattr(prompts_resp, "data", [])
+            if not items:
+                break
+            for pmeta in items:
+                try:
+                    prompt = with_retry(source.get_prompt, pmeta.name)
+                    try:
+                        kwargs = {
+                            "name": prompt.name,
+                            "prompt": prompt.prompt,
+                        }
+                        if hasattr(prompt, "type") and prompt.type:
+                            kwargs["type"] = prompt.type
+                        if hasattr(prompt, "labels") and prompt.labels:
+                            kwargs["labels"] = prompt.labels
+                        if hasattr(prompt, "config") and prompt.config is not None:
+                            kwargs["config"] = prompt.config
+                        if hasattr(prompt, "tags") and prompt.tags:
+                            kwargs["tags"] = prompt.tags
+                        with_retry(dest.create_prompt, **kwargs)
+                        count += 1
+                    except Exception as e:
+                        if "already exists" in str(e).lower() or "409" in str(e):
+                            log.debug("Prompt '%s' already exists -- skipping", prompt.name)
+                        else:
+                            log.warning("Failed to create prompt '%s': %s", prompt.name, e)
+                except Exception as e:
+                    log.warning("Failed to fetch prompt '%s': %s", pmeta.name, e)
+            meta = getattr(prompts_resp, "meta", None)
+            total_pages = getattr(meta, "total_pages", None)
+            if total_pages is not None and page >= total_pages:
+                break
+            if len(items) < 50:
+                break
+            page += 1
     except Exception as e:
         log.warning("Could not list prompts: %s", e)
         return 0
-
-    for pmeta in prompt_metas:
-        try:
-            # Fetch the full prompt (latest version) to get details
-            prompt = with_retry(source.get_prompt, pmeta.name)
-            try:
-                with_retry(
-                    dest.create_prompt,
-                    name=prompt.name,
-                    type=getattr(prompt, "type", "text"),
-                    prompt=prompt.prompt,
-                    labels=getattr(prompt, "labels", []),
-                    config=getattr(prompt, "config", None),
-                )
-                count += 1
-            except Exception as e:
-                if "already exists" in str(e).lower() or "409" in str(e):
-                    log.debug("Prompt '%s' already exists  --  skipping", prompt.name)
-                else:
-                    log.warning("Failed to create prompt '%s': %s", prompt.name, e)
-        except Exception as e:
-            log.warning("Failed to fetch prompt '%s': %s", pmeta.name, e)
 
     log.info("Prompts migrated: %d", count)
     return count
 
 
 # ---- 3. Datasets (definitions + items) ------------------------------
-def migrate_datasets(source: Langfuse, dest: Langfuse) -> tuple[int, int]:
+def migrate_datasets(source: Langfuse, dest: Langfuse) -> Tuple[int, int]:
     """Migrate dataset definitions and their items."""
     log.info("--- Migrating datasets ---")
     ds_count = 0
     item_count = 0
     try:
-        datasets_resp = with_retry(source.api.datasets.list)
-        datasets = datasets_resp.data
+        page = 1
+        while True:
+            datasets_resp = with_retry(source.api.datasets.list, page=page, limit=50)
+            items = getattr(datasets_resp, "data", [])
+            if not items:
+                break
+            for ds in items:
+                try:
+                    kwargs = {"name": ds.name}
+                    for opt in ("description", "metadata"):
+                        val = getattr(ds, opt, None)
+                        if val is not None:
+                            kwargs[opt] = val
+                    with_retry(dest.create_dataset, **kwargs)
+                    ds_count += 1
+                except Exception as e:
+                    if "already exists" in str(e).lower() or "409" in str(e):
+                        log.debug("Dataset '%s' already exists -- will still migrate items", ds.name)
+                    else:
+                        log.warning("Failed to create dataset '%s': %s", ds.name, e)
+                        continue
+
+                # Migrate dataset items
+                item_page = 1
+                while True:
+                    try:
+                        items_resp = with_retry(
+                            source.api.dataset_items.list,
+                            dataset_name=ds.name,
+                            page=item_page,
+                            limit=50,
+                        )
+                        d_items = getattr(items_resp, "data", [])
+                        if not d_items:
+                            break
+                        for item in d_items:
+                            try:
+                                i_kwargs = {
+                                    "dataset_name": ds.name,
+                                    "input": item.input,
+                                }
+                                for opt in ("expected_output", "metadata", "id"):
+                                    val = getattr(item, opt, None)
+                                    if val is not None:
+                                        i_kwargs[opt] = val
+                                with_retry(dest.create_dataset_item, **i_kwargs)
+                                item_count += 1
+                            except Exception as e:
+                                if "already exists" in str(e).lower() or "409" in str(e):
+                                    log.debug("Dataset item already exists -- skipping")
+                                else:
+                                    log.warning("Failed to create dataset item: %s", e)
+                        meta_items = getattr(items_resp, "meta", None)
+                        total_pages = getattr(meta_items, "total_pages", None)
+                        if total_pages is not None and item_page >= total_pages:
+                            break
+                        if len(d_items) < 50:
+                            break
+                        item_page += 1
+                    except Exception as e:
+                        log.warning("Failed to list items for dataset '%s': %s", ds.name, e)
+                        break
+
+            meta = getattr(datasets_resp, "meta", None)
+            total_pages = getattr(meta, "total_pages", None)
+            if total_pages is not None and page >= total_pages:
+                break
+            if len(items) < 50:
+                break
+            page += 1
     except Exception as e:
         log.warning("Could not list datasets: %s", e)
         return 0, 0
-
-    for ds in datasets:
-        # Create dataset in destination
-        try:
-            with_retry(
-                dest.create_dataset,
-                name=ds.name,
-                description=getattr(ds, "description", None),
-                metadata=getattr(ds, "metadata", None),
-            )
-            ds_count += 1
-        except Exception as e:
-            if "already exists" in str(e).lower() or "409" in str(e):
-                log.debug("Dataset '%s' already exists  --  will still migrate items", ds.name)
-            else:
-                log.warning("Failed to create dataset '%s': %s", ds.name, e)
-                continue
-
-        # Fetch and migrate items
-        try:
-            items_resp = with_retry(source.api.dataset_items.list, dataset_name=ds.name)
-            for item in items_resp.data:
-                try:
-                    with_retry(
-                        dest.create_dataset_item,
-                        dataset_name=ds.name,
-                        input=item.input,
-                        expected_output=getattr(item, "expected_output", None),
-                        metadata=getattr(item, "metadata", None),
-                        id=getattr(item, "id", None),
-                    )
-                    item_count += 1
-                except Exception as e:
-                    if "already exists" in str(e).lower() or "409" in str(e):
-                        log.debug("Dataset item already exists  --  skipping")
-                    else:
-                        log.warning("Failed to create dataset item: %s", e)
-        except Exception as e:
-            log.warning("Failed to list items for dataset '%s': %s", ds.name, e)
 
     log.info("Datasets migrated: %d  |  Dataset items migrated: %d", ds_count, item_count)
     return ds_count, item_count
 
 
 # ---- 4. Traces + Observations + Scores ------------------------------
+def _normalize_usage(usage) -> Optional[dict]:
+    """Normalize usage object into dict matching Langfuse Usage schema."""
+    if isinstance(usage, dict):
+        return usage
+    normalized = {}
+    for field in (
+        "input", "output", "total", "unit",
+        "input_cost", "output_cost", "total_cost",
+    ):
+        val = getattr(usage, field, None)
+        if val is not None:
+            normalized[field] = val
+    return normalized if normalized else None
+
+
+def _build_observation_body(trace_id: str, obs, time_delta: Optional[Any] = None) -> ObservationBody:
+    """Build ObservationBody with validated types compatible with Cloud & self-hosted."""
+    obs_type = getattr(obs, "type", "SPAN")
+    meta = getattr(obs, "metadata", None) or {}
+
+    # Langfuse Cloud ingestion schema strictly expects GENERATION, SPAN, or EVENT.
+    # Preserve original subtype (e.g. CHAIN, AGENT, TOOL) in metadata.
+    if obs_type not in ("GENERATION", "SPAN", "EVENT"):
+        if isinstance(meta, dict):
+            meta = {**meta, "_original_type": obs_type}
+        obs_type = "SPAN"
+
+    usage = getattr(obs, "usage", None)
+    if usage is not None:
+        usage = _normalize_usage(usage)
+
+    start_time = getattr(obs, "start_time", None)
+    end_time = getattr(obs, "end_time", None)
+    completion_start_time = getattr(obs, "completion_start_time", None)
+
+    if time_delta:
+        if start_time:
+            if isinstance(meta, dict):
+                meta = {**meta, "_original_start_time": start_time.isoformat()}
+            start_time = start_time + time_delta
+        if end_time:
+            end_time = end_time + time_delta
+        if completion_start_time:
+            completion_start_time = completion_start_time + time_delta
+
+    kwargs = {
+        "id": obs.id,
+        "trace_id": trace_id,
+        "type": obs_type,
+        "name": getattr(obs, "name", None),
+        "start_time": start_time,
+        "end_time": end_time,
+        "completion_start_time": completion_start_time,
+        "model": getattr(obs, "model", None),
+        "model_parameters": getattr(obs, "model_parameters", None),
+        "input": getattr(obs, "input", None),
+        "output": getattr(obs, "output", None),
+        "version": getattr(obs, "version", None),
+        "metadata": meta if meta else None,
+        "level": getattr(obs, "level", None),
+        "status_message": getattr(obs, "status_message", None),
+        "parent_observation_id": getattr(obs, "parent_observation_id", None),
+        "usage": usage,
+    }
+    return ObservationBody(**{k: v for k, v in kwargs.items() if v is not None})
+
+
 def migrate_traces(
     source: Langfuse,
     dest: Langfuse,
     batch_limit: int = 50,
-    obs_page_size: int = 100,
     from_timestamp: Optional[datetime] = None,
+    shift_to_now: bool = False,
 ) -> dict:
     """
     Migrate all traces, their nested observations, and associated scores
-    from the source to the destination.
-
-    Uses cursor-based pagination throughout.
-    Handles GENERATION, SPAN, and EVENT observation types.
+    from source to destination via batch ingestion.
     """
     log.info("--- Migrating traces, observations, and scores ---")
+    if shift_to_now:
+        log.info("Timestamp shifting ENABLED: traces will be shifted to current date to stay within Cloud 30-day retention.")
     stats = {"traces": 0, "observations": 0, "scores": 0, "errors": 0}
 
-    # Build trace listing filters
-    trace_filters = {}
+    # Build filters
+    filters = {}
     if from_timestamp:
-        trace_filters["from_timestamp"] = from_timestamp
+        filters["from_timestamp"] = from_timestamp
         log.info("Filtering traces from: %s", from_timestamp.isoformat())
 
-    # --- Iterate traces ---
-    trace_cursor = None
-    page_num = 0
+    page = 1
     while True:
         try:
-            list_kwargs = {"limit": batch_limit, **trace_filters}
-            if trace_cursor:
-                list_kwargs["cursor"] = trace_cursor
-            traces_resp = with_retry(source.api.traces.list, **list_kwargs)
-            traces = traces_resp.data
+            traces_resp = with_retry(
+                source.api.trace.list,
+                page=page,
+                limit=batch_limit,
+                **filters,
+            )
+            traces = getattr(traces_resp, "data", [])
         except Exception as err:
-            log.error("Failed to fetch traces (cursor=%s): %s", trace_cursor, err)
+            log.error("Failed to fetch traces (page=%d): %s", page, err)
             stats["errors"] += 1
             break
 
@@ -366,250 +428,179 @@ def migrate_traces(
             log.info("No more traces to process.")
             break
 
-        page_num += 1
-
         for trace in traces:
-            # --- 4a. Ingest the trace ---
-            try:
-                trace_kwargs = {
-                    "id": trace.id,
-                    "name": trace.name,
-                    "timestamp": trace.timestamp,
-                }
-                # Optional fields  --  only pass if present to avoid schema errors
-                for attr in (
-                    "user_id", "session_id", "tags", "metadata",
-                    "input", "output", "release", "version", "public",
-                ):
-                    val = getattr(trace, attr, None)
-                    if val is not None:
-                        trace_kwargs[attr] = val
+            trace_events = []
 
-                with_retry(dest.trace, **trace_kwargs)
-                stats["traces"] += 1
+            # Fetch full trace details
+            trace_full = None
+            try:
+                trace_full = with_retry(source.api.trace.get, trace.id)
             except Exception as e:
-                log.warning("Failed to ingest trace %s: %s", trace.id, e)
+                log.warning("Could not fetch full trace %s: %s", trace.id, e)
+
+            # Compute time delta if shifting
+            t_obj = trace_full or trace
+            orig_ts = getattr(t_obj, "timestamp", None)
+            time_delta = None
+            ts_to_use = orig_ts
+            t_meta = getattr(t_obj, "metadata", None) or {}
+
+            if shift_to_now and orig_ts:
+                now_utc = datetime.now(timezone.utc)
+                time_delta = now_utc - orig_ts
+                ts_to_use = now_utc
+                if isinstance(t_meta, dict):
+                    t_meta = {**t_meta, "_original_timestamp": orig_ts.isoformat()}
+
+            # 1. Trace Event
+            try:
+                trace_body = TraceBody(
+                    id=t_obj.id,
+                    name=getattr(t_obj, "name", None),
+                    timestamp=ts_to_use,
+                    user_id=getattr(t_obj, "user_id", None),
+                    session_id=getattr(t_obj, "session_id", None),
+                    release=getattr(t_obj, "release", None),
+                    version=getattr(t_obj, "version", None),
+                    metadata=t_meta if t_meta else None,
+                    tags=getattr(t_obj, "tags", None),
+                    public=getattr(t_obj, "public", None),
+                    input=getattr(t_obj, "input", None),
+                    output=getattr(t_obj, "output", None),
+                )
+                trace_events.append(
+                    IngestionEvent_TraceCreate(
+                        id=str(uuid.uuid4()),
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        body=trace_body,
+                    )
+                )
+            except Exception as e:
+                log.warning("Failed to prepare trace %s: %s", trace.id, e)
                 stats["errors"] += 1
                 continue
 
-            # --- 4b. Ingest observations (exhaustive cursor pagination) ---
-            obs_cursor = None
-            while True:
+            # 2. Observations
+            observations = getattr(trace_full, "observations", None)
+            if observations is None:
                 try:
-                    obs_kwargs = {"trace_id": trace.id, "limit": obs_page_size}
-                    if obs_cursor:
-                        obs_kwargs["cursor"] = obs_cursor
-                    obs_resp = with_retry(
-                        source.api.observations.get_many, **obs_kwargs
+                    legacy_resp = with_retry(
+                        source.api.legacy.observations_v1.get_many, trace_id=trace.id
                     )
-                    observations = obs_resp.data
-                except Exception as obs_err:
+                    observations = getattr(legacy_resp, "data", [])
+                except Exception:
+                    observations = []
+
+            obs_count_trace = 0
+            for obs in observations:
+                try:
+                    obs_body = _build_observation_body(trace.id, obs, time_delta=time_delta)
+                    trace_events.append(
+                        IngestionEvent_ObservationCreate(
+                            id=str(uuid.uuid4()),
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            body=obs_body,
+                        )
+                    )
+                    obs_count_trace += 1
+                except Exception as e:
                     log.warning(
-                        "Failed to fetch observations for trace %s: %s",
+                        "Failed to prepare observation %s (trace %s): %s",
+                        getattr(obs, "id", "unknown"),
                         trace.id,
-                        obs_err,
+                        e,
                     )
                     stats["errors"] += 1
-                    break
 
-                if not observations:
-                    break
-
-                for obs in observations:
-                    try:
-                        _ingest_observation(dest, trace.id, obs)
-                        stats["observations"] += 1
-                    except Exception as e:
-                        log.warning(
-                            "Failed to ingest observation %s (trace %s): %s",
-                            obs.id,
-                            trace.id,
-                            e,
+            # 3. Scores
+            scores = getattr(trace_full, "scores", None) or []
+            scores_count_trace = 0
+            for score in scores:
+                try:
+                    score_body = ScoreBody(
+                        id=getattr(score, "id", str(uuid.uuid4())),
+                        trace_id=trace.id,
+                        name=score.name,
+                        value=score.value,
+                        session_id=getattr(score, "session_id", None),
+                        observation_id=getattr(score, "observation_id", None),
+                        comment=getattr(score, "comment", None),
+                        metadata=getattr(score, "metadata", None),
+                        data_type=getattr(score, "data_type", None),
+                        config_id=getattr(score, "config_id", None),
+                    )
+                    trace_events.append(
+                        IngestionEvent_ScoreCreate(
+                            id=str(uuid.uuid4()),
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            body=score_body,
                         )
+                    )
+                    scores_count_trace += 1
+                except Exception as e:
+                    log.warning("Failed to prepare score for trace %s: %s", trace.id, e)
+                    stats["errors"] += 1
+
+            # 4. Ingest batch for this trace into destination
+            if trace_events:
+                chunk_size = 100
+                for i in range(0, len(trace_events), chunk_size):
+                    chunk = trace_events[i : i + chunk_size]
+                    try:
+                        res = with_retry(dest.api.ingestion.batch, batch=chunk)
+                        if res.errors:
+                            for err in res.errors:
+                                log.warning(
+                                    "Ingestion error for trace %s: [%s] %s (%s)",
+                                    trace.id,
+                                    err.status,
+                                    err.message,
+                                    err.error,
+                                )
+                                stats["errors"] += 1
+                    except Exception as e:
+                        log.warning("Failed to ingest batch for trace %s: %s", trace.id, e)
                         stats["errors"] += 1
 
-                # Next page of observations
-                obs_meta = getattr(obs_resp, "meta", None)
-                obs_cursor = (
-                    getattr(obs_meta, "next_cursor", None) if obs_meta else None
-                )
-                if not obs_cursor:
-                    break
+            stats["traces"] += 1
+            stats["observations"] += obs_count_trace
+            stats["scores"] += scores_count_trace
 
-            # --- 4c. Ingest scores for this trace ---
-            try:
-                score_cursor = None
-                while True:
-                    score_kwargs = {"trace_id": trace.id, "limit": obs_page_size}
-                    if score_cursor:
-                        score_kwargs["cursor"] = score_cursor
-
-                    # Try v3 scores API first, fall back to v2
-                    try:
-                        scores_resp = with_retry(
-                            source.api.scores_v3.list, **score_kwargs
-                        )
-                    except (AttributeError, Exception):
-                        scores_resp = with_retry(
-                            source.api.scores.list, **score_kwargs
-                        )
-
-                    scores = scores_resp.data
-                    if not scores:
-                        break
-
-                    for score in scores:
-                        try:
-                            score_create_kwargs = {
-                                "trace_id": trace.id,
-                                "name": score.name,
-                                "value": score.value,
-                            }
-                            for s_attr in (
-                                "observation_id",
-                                "comment",
-                                "data_type",
-                                "config_id",
-                            ):
-                                s_val = getattr(score, s_attr, None)
-                                if s_val is not None:
-                                    score_create_kwargs[s_attr] = s_val
-
-                            with_retry(dest.score, **score_create_kwargs)
-                            stats["scores"] += 1
-                        except Exception as e:
-                            log.warning(
-                                "Failed to ingest score for trace %s: %s",
-                                trace.id,
-                                e,
-                            )
-                            stats["errors"] += 1
-
-                    s_meta = getattr(scores_resp, "meta", None)
-                    score_cursor = (
-                        getattr(s_meta, "next_cursor", None) if s_meta else None
-                    )
-                    if not score_cursor:
-                        break
-            except Exception as e:
-                log.warning(
-                    "Failed to fetch scores for trace %s: %s", trace.id, e
-                )
-
-        # Flush the current batch
-        dest.flush()
         log.info(
-            "Page %d complete  --  %d traces / %d observations / %d scores so far",
-            page_num,
+            "Page %d complete  --  %d traces / %d observations / %d scores migrated so far",
+            page,
             stats["traces"],
             stats["observations"],
             stats["scores"],
         )
 
-        # Throttle between pages to respect rate limits
+        # Pagination termination checks
+        meta = getattr(traces_resp, "meta", None)
+        total_pages = getattr(meta, "total_pages", None)
+        if total_pages is not None and page >= total_pages:
+            break
+        if len(traces) < batch_limit:
+            break
+        page += 1
         time.sleep(0.3)
 
-        # Move to next page
-        t_meta = getattr(traces_resp, "meta", None)
-        trace_cursor = getattr(t_meta, "next_cursor", None) if t_meta else None
-        if not trace_cursor:
-            break
-
     return stats
-
-
-def _ingest_observation(dest: Langfuse, trace_id: str, obs) -> None:
-    """
-    Route an observation to the correct ingestion method based on its type.
-    Handles GENERATION, SPAN, and EVENT types.
-    """
-    obs_type = getattr(obs, "type", "SPAN")
-
-    # Common fields shared across all observation types
-    common = {
-        "id": obs.id,
-        "trace_id": trace_id,
-        "name": obs.name,
-        "start_time": obs.start_time,
-        "metadata": getattr(obs, "metadata", None),
-        "level": getattr(obs, "level", None),
-        "status_message": getattr(obs, "status_message", None),
-        "parent_observation_id": getattr(obs, "parent_observation_id", None),
-        "input": getattr(obs, "input", None),
-        "output": getattr(obs, "output", None),
-        "version": getattr(obs, "version", None),
-    }
-
-    # Remove None values to avoid sending empty optionals
-    common = {k: v for k, v in common.items() if v is not None}
-
-    if obs_type == "GENERATION":
-        gen_fields = {}
-        for attr in ("end_time", "model", "model_parameters"):
-            val = getattr(obs, attr, None)
-            if val is not None:
-                gen_fields[attr] = val
-
-        # Handle usage carefully  --  normalize the structure
-        usage_raw = getattr(obs, "usage", None)
-        if usage_raw is not None:
-            gen_fields["usage"] = _normalize_usage(usage_raw)
-
-        with_retry(dest.generation, **common, **gen_fields)
-
-    elif obs_type == "EVENT":
-        # Events do NOT have end_time
-        with_retry(dest.event, **common)
-
-    else:
-        # SPAN (default)
-        end_time = getattr(obs, "end_time", None)
-        if end_time is not None:
-            common["end_time"] = end_time
-        with_retry(dest.span, **common)
-
-
-def _normalize_usage(usage) -> dict:
-    """
-    Normalize the usage object from the read API into the format
-    expected by the ingestion API. The read API may return a Usage
-    object; the ingestion API expects a plain dict.
-    """
-    if isinstance(usage, dict):
-        return usage
-
-    # Convert from SDK Usage object to dict
-    normalized = {}
-    for field in ("input", "output", "total", "unit",
-                  "input_cost", "output_cost", "total_cost"):
-        val = getattr(usage, field, None)
-        if val is not None:
-            normalized[field] = val
-
-    # Some versions use prompt_tokens / completion_tokens
-    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        val = getattr(usage, field, None)
-        if val is not None:
-            normalized[field] = val
-
-    return normalized if normalized else None
 
 
 # =====================================================================
 # VERIFICATION
 # =====================================================================
 def verify_migration(source: Langfuse, dest: Langfuse, stats: dict) -> None:
-    """Run a simple count-based verification after migration."""
+    """Run a count-based verification summary after migration."""
     log.info("--- Verification ---")
-    log.info("Traces transferred:      %d", stats["traces"])
+    log.info("Traces transferred:       %d", stats["traces"])
     log.info("Observations transferred: %d", stats["observations"])
-    log.info("Scores transferred:      %d", stats["scores"])
-    log.info("Errors encountered:      %d", stats["errors"])
+    log.info("Scores transferred:       %d", stats["scores"])
+    log.info("Errors encountered:       %d", stats["errors"])
 
     if stats["errors"] > 0:
         log.warning(
-            "[!] %d errors occurred during migration. "
-            "Review the log output above for details.",
+            "[!] %d errors occurred during migration. Review the log output above for details.",
             stats["errors"],
         )
     else:
@@ -667,6 +658,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Authenticate and count source data without writing to destination",
     )
+    p.add_argument(
+        "--shift-to-now",
+        action="store_true",
+        help="Shift historical trace & observation timestamps to the current date "
+        "so they are visible within Langfuse Cloud's 30-day retention window. "
+        "Original timestamps are preserved in metadata.",
+    )
     return p.parse_args()
 
 
@@ -696,12 +694,75 @@ def main():
     )
 
     if args.dry_run:
-        log.info("DRY RUN  --  will read from source but not write to destination.")
-        # Just count traces
-        count = 0
-        for _ in paginate_simple(source.api.traces.list, page_size=args.batch_limit):
-            count += 1
-        log.info("Source contains %d traces.", count)
+        log.info("DRY RUN -- counting source data without writing to destination.")
+        cfg_count = 0
+        try:
+            cfgs = source.api.score_configs.get(limit=100)
+            cfg_count = getattr(
+                getattr(cfgs, "meta", None), "total_items", len(getattr(cfgs, "data", []))
+            )
+        except Exception:
+            pass
+
+        prompt_count = 0
+        try:
+            p_resp = source.api.prompts.list(limit=100)
+            prompt_count = getattr(
+                getattr(p_resp, "meta", None),
+                "total_items",
+                len(getattr(p_resp, "data", [])),
+            )
+        except Exception:
+            pass
+
+        ds_count = 0
+        try:
+            d_resp = source.api.datasets.list(limit=100)
+            ds_count = getattr(
+                getattr(d_resp, "meta", None),
+                "total_items",
+                len(getattr(d_resp, "data", [])),
+            )
+        except Exception:
+            pass
+
+        trace_count = 0
+        obs_count = 0
+        scores_count = 0
+        page = 1
+        filters = {}
+        if from_ts:
+            filters["from_timestamp"] = from_ts
+        while True:
+            t_resp = source.api.trace.list(page=page, limit=args.batch_limit, **filters)
+            t_data = getattr(t_resp, "data", [])
+            if not t_data:
+                break
+            for t in t_data:
+                trace_count += 1
+                try:
+                    tf = source.api.trace.get(t.id)
+                    obs_count += len(getattr(tf, "observations", []) or [])
+                    scores_count += len(getattr(tf, "scores", []) or [])
+                except Exception:
+                    pass
+            meta = getattr(t_resp, "meta", None)
+            total_pages = getattr(meta, "total_pages", None)
+            if total_pages is not None and page >= total_pages:
+                break
+            if len(t_data) < args.batch_limit:
+                break
+            page += 1
+
+        log.info("=" * 60)
+        log.info("DRY RUN SUMMARY:")
+        log.info("  Score configs: %d", cfg_count)
+        log.info("  Prompts:       %d", prompt_count)
+        log.info("  Datasets:      %d", ds_count)
+        log.info("  Traces:        %d", trace_count)
+        log.info("  Observations:  %d", obs_count)
+        log.info("  Scores:        %d", scores_count)
+        log.info("=" * 60)
         return
 
     log.info("=" * 60)
@@ -724,16 +785,14 @@ def main():
     if not args.skip_datasets:
         migrate_datasets(source, dest)
 
-    # Step 4: Traces + Observations + Scores (the big one)
+    # Step 4: Traces + Observations + Scores
     stats = migrate_traces(
         source,
         dest,
         batch_limit=args.batch_limit,
         from_timestamp=from_ts,
+        shift_to_now=args.shift_to_now,
     )
-
-    # Final flush and shutdown
-    dest.shutdown()
 
     elapsed = time.time() - start_time
     log.info("=" * 60)
